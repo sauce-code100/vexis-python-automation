@@ -1,0 +1,32 @@
+using the supplied collection image, describe each of the images in this collection individually and create robust descriptive detailed prompts for generating each design separately via a generative ai.
+invent new designs: as many invented as originally exist (double the total up to 10) in the same style. if the prompt is requesting text is generated, the text to be generated must be explicitly spelled out.
+do not generate any images, just return the prompts.
+create a very descriptive group_description as well using adjectives and describe how they might use it in their work.
+also create detailed product descriptions and put it in the descriptions fields.
+it should be very descriptive about the kind of design and its type and what the image contains and how they might use it in their craft or design work. ignore the words svg, png, dfx, eps if present on the image.
+the group description needs to describe every one of the individual items that is included with it which you are creating with the individual prompts, including emojis where appropriate.
+the "text_gen_flag" needs to be set to 1 if the individual prompt is requesting any text or words to be generated in the prompt, otherwise, set it to 0.
+please return your data in valid json form with no additional commentary in this format:
+
+{
+  "group_description": "This set includes various mountain illustrations, each with unique details and styles. The designs feature elements such as trees, birds, and different mountain shapes and arrangements. item 1 with description\n\nitem 2 with description",
+  "group_tags": "all the relevant tags describing this group, as many as possible separated by commas",
+  "individual_prompts": [
+    {
+      "name" : "Mountain Range with Trees",
+      "description": "the description goes here",
+      "prompt": "Create a black and white SVG design featuring a mountain range with multiple peaks and a cluster of pine trees at the base. The mountains should have sharp, jagged edges, and the trees should be detailed with visible branches and needles.",
+      "tags": "all the relevant tags describing this image, as many as possible separated by commas",
+      "text_gen_flag": 0 #(0 if the prompt does not request a word or phrase be generated in the prompt, 1 if it does request text to be generated.)
+    },
+    {
+      "name" : "Isolated Mountain Peak",
+      "description": "description goes here",
+      "prompt": "Generate a few color SVG design of a single, isolated mountain peak. The mountain should have rugged, craggy features with detailed shading to emphasize its steep slopes and rocky texture.  The words 'mountain' and 'peak' should be bold and large in the text.",
+      "tags": "all the relevant tags describing this image, as many as possible separated by commas",
+      "text_gen_flag": 1 #(0 if the prompt does not request a word or phrase be generated in the prompt, 1 if it does request text to be generated.)
+    }
+  ]
+}
+do not add anything to the description to indicate any of them were imagined or made up at any point don't point that out. randomize the entries.
+add any mood descriptors that are appropriate and style descriptors.
