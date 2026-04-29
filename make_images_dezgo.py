@@ -1,7 +1,7 @@
 import os
 import sys
-import sqlite3
 import requests
+from pymongo import MongoClient
 from dotenv import load_dotenv
 import time
 import traceback
@@ -14,71 +14,43 @@ ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 DEZGO_API_KEY = os.getenv("DEZGO_API_KEY")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "database-scraper.db")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "designbundles_scraper")
 
 
 def setup_database():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    """Connect to MongoDB and ensure the images collection has indexes."""
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB_NAME]
 
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='images'")
-    table_exists = cursor.fetchone()
+    # Ensure images collection exists with useful indexes
+    images = db["images"]
+    images.create_index("group_id")
+    images.create_index("template_id")
+    log(f"Connected to MongoDB database '{MONGO_DB_NAME}'.", "info")
 
-    if not table_exists:
-        cursor.execute(
-            """
-            CREATE TABLE images (
-                image_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id INTEGER,
-                template_id INTEGER,
-                converted INTEGER DEFAULT 0,
-                title TEXT,
-                prompt TEXT,
-                description TEXT,
-                tags TEXT,
-                categories TEXT,
-                kind TEXT,
-                text_gen_flag BOOLEAN,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                spellchecked INTEGER,
-                filename TEXT,
-                thumbnail TEXT,
-                wordpress_id INTEGER
-            )
-            """
-        )
-        conn.commit()
-        log("Created images table", "info")
-    else:
-        log("images table already exists", "info")
-
-    return conn
+    return client, db
 
 
-def get_image_templates(conn):
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT template_id, group_id, name, prompt, description, tags, kind, text_gen_flag FROM image_templates "
-        "WHERE processed = 0"
+def get_image_templates(db):
+    """Return all image_templates with processed == 0."""
+    return list(db["image_templates"].find(
+        {"processed": 0},
+        {"_id": 1, "group_id": 1, "name": 1, "prompt": 1, "description": 1, "tags": 1, "kind": 1, "text_gen_flag": 1},
+    ))
+
+
+def update_template_status(db, template_id, status):
+    """Update the processed field on an image_template document."""
+    db["image_templates"].update_one(
+        {"_id": template_id},
+        {"$set": {"processed": status}},
     )
-    entries = cursor.fetchall()
-
-    return entries
-
-
-def update_template_status(conn, template_id, status):
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE image_templates SET processed = ? WHERE template_id = ?", (status, template_id)
-    )
-    conn.commit()
-
-    log(f"[update_template_status] Updated template status in images_template table: id = {template_id}, status = {status}", "info")
+    log(f"[update_template_status] Updated template status in image_templates collection: id = {template_id}, status = {status}", "info")
 
 
 def insert_image_entry(
-    conn,
+    db,
     group_id,
     template_id,
     title,
@@ -89,23 +61,26 @@ def insert_image_entry(
     text_gen_flag,
     filename_without_extension
 ):
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO images (group_id, template_id, title, prompt, description, tags, kind, text_gen_flag, filename) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            group_id,
-            template_id,
-            title,
-            prompt,
-            description,
-            tags,
-            kind,
-            text_gen_flag,
-            filename_without_extension
-        ),
-    )
-    conn.commit()
-    log(f"[insert_image_entry] Inserted new image entry in images table: template_id = {template_id}", "info")
+    """Insert a new document into the images collection."""
+    db["images"].insert_one({
+        "group_id": group_id,
+        "template_id": template_id,
+        "converted": 0,
+        "title": title,
+        "prompt": prompt,
+        "description": description,
+        "tags": tags,
+        "categories": None,
+        "kind": kind,
+        "text_gen_flag": text_gen_flag,
+        "input_tokens": None,
+        "output_tokens": None,
+        "spellchecked": None,
+        "filename": filename_without_extension,
+        "thumbnail": None,
+        "wordpress_id": None,
+    })
+    log(f"[insert_image_entry] Inserted new image entry in images collection: template_id = {template_id}", "info")
 
 
 def generate_dezgo_image(prompt, width=1024, height=1024, transparent=True, format="png"):
@@ -165,10 +140,10 @@ def download_dezgo_image(image_data, group_id, filename):
         return False
 
 
-def process_images(conn, group_number = 72):
+def process_images(db, group_number = 72):
     log("[process_images] Starting image processing", "info")
     
-    image_templates = get_image_templates(conn)
+    image_templates = get_image_templates(db)
     if not image_templates:
         log("[process_images] No entries to process. Exiting.", "info")
         return
@@ -178,9 +153,16 @@ def process_images(conn, group_number = 72):
     total_images = 0
 
     try:
-        for entry in image_templates:
-            log(f"[process_images] Processing entry: {entry}", "info")
-            template_id, group_id, name, prompt, description, tags, kind, text_gen_flag = entry
+        for doc in image_templates:
+            log(f"[process_images] Processing entry: {doc}", "info")
+            template_id = doc["_id"]
+            group_id = doc["group_id"]
+            name = doc["name"]
+            prompt = doc["prompt"]
+            description = doc["description"]
+            tags = doc["tags"]
+            kind = doc["kind"]
+            text_gen_flag = doc["text_gen_flag"]
 
             group_set.add(group_id)
             if len(group_set) > group_number:
@@ -189,7 +171,7 @@ def process_images(conn, group_number = 72):
 
             if "birth announcement" in prompt.lower():
                 log(f"[process_images] Skipping entry with ID {template_id} due to 'birth announcement' in prompt", "info")
-                update_template_status(conn, template_id, 2)
+                update_template_status(db, template_id, 2)
                 continue
             
             prompt += " Use a pure white background."
@@ -203,9 +185,9 @@ def process_images(conn, group_number = 72):
                 filename = str(uuid.uuid4().hex[:20])
                 download_dezgo_image(image_data, group_id, filename + ".png")
 
-                log(f"[process_images] Appending row to images table", "info")
+                log(f"[process_images] Appending document to images collection", "info")
                 insert_image_entry(
-                    conn,
+                    db,
                     group_id,
                     template_id,
                     name,
@@ -218,7 +200,7 @@ def process_images(conn, group_number = 72):
                 )
                 total_images += 1
 
-                update_template_status(conn, template_id, 1)
+                update_template_status(db, template_id, 1)
 
     except SystemExit as e:
         log(f"[process_images] SystemExit: {str(e)}", "error")
@@ -233,8 +215,9 @@ def process_images(conn, group_number = 72):
 
 if __name__ == "__main__":
     start_time = time.time()
-    conn = setup_database()
-    process_images(conn)
+    client, db = setup_database()
+    process_images(db)
+    client.close()
     end_time = time.time()
     elapsed_time = end_time - start_time
     log(f"[main] Total execution time: {elapsed_time//60} minutes", "info")

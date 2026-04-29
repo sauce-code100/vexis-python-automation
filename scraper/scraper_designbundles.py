@@ -1,7 +1,8 @@
 import json
 import os, sys
 import requests
-import sqlite3
+from pymongo import MongoClient
+from dotenv import load_dotenv
 import time
 import re
 from urllib.parse import urlparse
@@ -27,7 +28,11 @@ IMAGE_FOLDER = os.path.join(os.path.dirname(__file__), "scraper_images")
 if not os.path.exists(IMAGE_FOLDER):
     os.makedirs(IMAGE_FOLDER)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "database-scraper.db")
+# Load .env from the project root (one level up from /scraper)
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "designbundles_scraper")
 
 
 def safe_str(x):
@@ -89,38 +94,16 @@ def save_progress(progress):
 
 
 def setup_database():
-    # Check if the database file exists
-    db_exists = os.path.exists(DB_PATH)
-    
-    # Connect to the database (this will create it if it doesn't exist)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # If the database didn't exist, create the groups table
-    if not db_exists:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS groups (
-                group_id INTEGER PRIMARY KEY,
-                processed INTEGER DEFAULT 0,
-                title TEXT,
-                description TEXT,
-                tags TEXT,
-                categories TEXT,
-                kind TEXT,
-                thumbnail TEXT,
-                wordpress_id INTEGER,
-                input_tokens INTEGER,
-                output_tokens INTEGER
-            )
-            """
-        )
-        print("Database and groups table created successfully.")
-    else:
-        print("Database already exists.")
-    
-    conn.commit()
-    return conn
+    """Connect to MongoDB and ensure the groups collection has a unique index on group_id."""
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB_NAME]
+    collection = db["groups"]
+
+    # Ensure a unique index on group_id to prevent duplicate inserts
+    collection.create_index("group_id", unique=True)
+    print(f"Connected to MongoDB database '{MONGO_DB_NAME}'.")
+
+    return client, db, collection
 
 
 def get_image_subfolder(group_id):
@@ -149,18 +132,34 @@ def download_image(url, image_path):
         print(f"Error downloading image: {e}")
 
 
-def insert_group(conn, group_id, title, kind):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT OR IGNORE INTO groups (group_id, title, kind) VALUES (?, ?, ?)
-        """,
-        (group_id, title, kind),
+def insert_group(collection, group_id, title, kind):
+    """Insert a group document if it doesn't already exist (upsert with $setOnInsert)."""
+    result = collection.update_one(
+        {"group_id": group_id},
+        {
+            "$setOnInsert": {
+                "group_id": group_id,
+                "processed": 0,
+                "title": title,
+                "description": None,
+                "tags": None,
+                "categories": None,
+                "kind": kind,
+                "thumbnail": None,
+                "wordpress_id": None,
+                "input_tokens": None,
+                "output_tokens": None,
+            }
+        },
+        upsert=True,
     )
-    conn.commit()
 
-    print(f"Inserted group: {title}")
-    return cursor.lastrowid
+    if result.upserted_id:
+        print(f"Inserted group: {title}")
+    else:
+        print(f"Group already exists, skipped: {title}")
+
+    return result.upserted_id
 
 
 def scrape_designbundles(page_number):
@@ -171,7 +170,7 @@ def scrape_designbundles(page_number):
     driver = webdriver.Chrome()
     driver.set_window_position(0, 0)
 
-    conn = setup_database()
+    client, db, collection = setup_database()
 
     cookie_button_clicked = False
 
@@ -219,7 +218,7 @@ def scrape_designbundles(page_number):
                         parent_element = element.find_element(
                             By.XPATH, ".//ancestor::div[contains(@class, 'product-box')]",
                         )
-                        
+
                         # Extract group ID
                         group_id = extract_group_id(element, parent_element)
                         print(f"\nGroup ID: {group_id}")
@@ -260,7 +259,7 @@ def scrape_designbundles(page_number):
                         download_image(img_url, img_path)
 
                         # Insert group data into the database
-                        insert_group(conn, group_id, title, kind)
+                        insert_group(collection, group_id, title, kind)
 
                     except Exception as e:
                         print(f"Error processing element: {e}")
@@ -278,7 +277,7 @@ def scrape_designbundles(page_number):
             break
 
     driver.quit()
-    conn.close()
+    client.close()
 
 
 if __name__ == "__main__":
