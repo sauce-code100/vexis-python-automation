@@ -1,17 +1,17 @@
-import sqlite3
 import json
 import os
 import sys
 import base64
 import requests
+from pymongo import MongoClient
 from dotenv import load_dotenv
 from pprint import pprint
 import time
 
 
-# This script reads the unprocessed entries from database-scraper.db and
+# This script reads the unprocessed entries from MongoDB and
 # processes them by sending the group image and a big prompt to the LLM.
-# It then writes the individual images' prompts into the image_templates table,
+# It then writes the individual images' prompts into the image_templates collection,
 # setting the text_gen_flag based on the JSON response from the LLM.
 
 # because of return token limits, the descriptions are not long enough so lets skip those
@@ -38,81 +38,48 @@ if not API_KEY:
 else:
     log(f"Using OpenAI API Key: {API_KEY[:5]}...{API_KEY[-5:]}", "info")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "database-scraper.db")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "designbundles_scraper")
 PROMPT_FILE_PATH = os.path.join(os.path.dirname(__file__), "scraper_prompt.txt")
 IMAGE_FOLDER = os.path.join(os.path.dirname(__file__), "scraper_images")
 
 
 def setup_database():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    """Connect to MongoDB and ensure the image_templates collection has indexes."""
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB_NAME]
 
-    # Check if image_templates table exists
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='image_templates'")
-    table_exists = cursor.fetchone()
+    # Ensure image_templates collection exists with a useful index
+    image_templates = db["image_templates"]
+    image_templates.create_index("group_id")
+    log(f"Connected to MongoDB database '{MONGO_DB_NAME}'.", "info")
 
-    if not table_exists:
-        # Create image_templates table if it doesn't exist
-        cursor.execute(
-            """
-            CREATE TABLE image_templates (
-                template_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id INTEGER,
-                processed INTEGER DEFAULT 0,
-                name TEXT,
-                prompt TEXT,
-                description TEXT,
-                tags TEXT,
-                categories TEXT,
-                kind TEXT,
-                text_gen_flag BOOLEAN,
-                input_tokens INTEGER,
-                output_tokens INTEGER
-            )
-            """
-        )
-        conn.commit()
-        log("Created image_templates table in the database.", "info")
-    else:
-        log("image_templates table already exists in the database.", "info")
-
-    return conn
+    return client, db
 
 
-def get_unprocessed_groups(conn):
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT group_id, title, kind, input_tokens, output_tokens FROM groups WHERE processed = 0"
-    )
-    return cursor.fetchall()
+def get_unprocessed_groups(db):
+    """Return all groups with processed == 0."""
+    groups_col = db["groups"]
+    return list(groups_col.find(
+        {"processed": 0},
+        {"group_id": 1, "title": 1, "kind": 1, "input_tokens": 1, "output_tokens": 1, "_id": 0},
+    ))
 
 
-def update_group_status(conn, group_id, status, group_description=None, group_tags=None, input_tokens=None, output_tokens=None):
-    cursor = conn.cursor()
-    update_query = "UPDATE groups SET processed = ?"
-    update_params = [status]
+def update_group_status(db, group_id, status, group_description=None, group_tags=None, input_tokens=None, output_tokens=None):
+    """Update fields on a group document identified by group_id."""
+    update_fields = {"processed": status}
 
     if input_tokens is not None:
-        update_query += ", input_tokens = ?"
-        update_params.append(input_tokens)
-    
+        update_fields["input_tokens"] = input_tokens
     if output_tokens is not None:
-        update_query += ", output_tokens = ?"
-        update_params.append(output_tokens)
-    
+        update_fields["output_tokens"] = output_tokens
     if group_description is not None:
-        update_query += ", description = ?"
-        update_params.append(group_description)
-    
+        update_fields["description"] = group_description
     if group_tags is not None:
-        update_query += ", tags = ?"
-        update_params.append(group_tags)
-    
-    update_query += " WHERE group_id = ?"
-    update_params.append(group_id)
+        update_fields["tags"] = group_tags
 
-    cursor.execute(update_query, tuple(update_params))
-    conn.commit()
+    db["groups"].update_one({"group_id": group_id}, {"$set": update_fields})
 
 
 def encode_image(image_path):
@@ -168,7 +135,7 @@ def construct_payload(group_title, prompt_template, base64_image):
 
 
 def handle_response(
-    conn,
+    db,
     response,
     group_id,
     group_title,
@@ -181,12 +148,12 @@ def handle_response(
     json_content = extract_json_content(response_text)
     if json_content is None:
         log(f"No JSON content found for Group {group_title} (ID: {group_id})", "error")
-        update_group_status(conn, group_id, 2)
+        update_group_status(db, group_id, 2)
         return
 
     if not is_valid_json(json_content):
         log(f"Invalid JSON response for Group {group_title} (ID: {group_id})", "error")
-        update_group_status(conn, group_id, 2)
+        update_group_status(db, group_id, 2)
         return
 
     try:
@@ -194,12 +161,12 @@ def handle_response(
     except json.JSONDecodeError as e:
         log(f"Error decoding JSON content: {e}", "error")
         log(f"Problematic JSON content: {json_content}", "error")
-        update_group_status(conn, group_id, 2)
+        update_group_status(db, group_id, 2)
         return
 
     if "error" in response_data:
         log(f"OpenAI API error: {response_data['error']['message']}", "error")
-        update_group_status(conn, group_id, 2)
+        update_group_status(db, group_id, 2)
         return
 
     # Extract the nested JSON content from the 'content' field
@@ -212,7 +179,7 @@ def handle_response(
     except json.JSONDecodeError as e:
         log(f"Error decoding nested JSON content: {e}", "error")
         log(f"Problematic nested JSON content: {nested_json_content}", "error")
-        # update_group_status(conn, group_id, 2)
+        # update_group_status(db, group_id, 2)
         return
 
     group_description = nested_response_data.get("group_description", "")
@@ -238,7 +205,7 @@ def handle_response(
         log(f"Preparing to insert into image_templates for Group {group_title} (ID: {group_id})", "info")
         log(f"Prompt data: {prompt_data}", "info")
         insert_image_template(
-            conn,
+            db,
             group_id,
             prompt_data["name"],
             prompt_data["prompt"],
@@ -249,19 +216,27 @@ def handle_response(
         )
         log(f"Inserted new image template for Group {group_title} (ID: {group_id})", "info")
 
-    update_group_status(conn, group_id, 1, group_description, group_tags, input_tokens, output_tokens)
+    update_group_status(db, group_id, 1, group_description, group_tags, input_tokens, output_tokens)
     log(f"Marked Group {group_title} (ID: {group_id}) as processed", "info")
 
 
 def insert_image_template(
-    conn, group_id, name, prompt, description, tags, group_kind, text_gen_flag
+    db, group_id, name, prompt, description, tags, group_kind, text_gen_flag
 ):
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO image_templates (group_id, name, prompt, description, tags, kind, text_gen_flag) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (group_id, name, prompt, description, tags, group_kind, text_gen_flag),
-    )
-    conn.commit()
+    """Insert a new document into the image_templates collection."""
+    db["image_templates"].insert_one({
+        "group_id": group_id,
+        "processed": 0,
+        "name": name,
+        "prompt": prompt,
+        "description": description,
+        "tags": tags,
+        "categories": None,
+        "kind": group_kind,
+        "text_gen_flag": text_gen_flag,
+        "input_tokens": None,
+        "output_tokens": None,
+    })
 
 
 def process_groups():
@@ -269,21 +244,21 @@ def process_groups():
     with open(PROMPT_FILE_PATH, "r") as file:
         prompt_template = file.read()
 
-    conn = setup_database()
-    unprocessed_groups = get_unprocessed_groups(conn)
+    client, db = setup_database()
+    unprocessed_groups = get_unprocessed_groups(db)
 
     total_groups = len(unprocessed_groups)
     log(f"Total groups to process: {total_groups}", "info")
 
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
-    for idx, (
-        group_id,
-        group_title,
-        group_kind,
-        input_tokens,
-        output_tokens,
-    ) in enumerate(unprocessed_groups, start=1):
+    for idx, group_doc in enumerate(unprocessed_groups, start=1):
+        group_id = group_doc["group_id"]
+        group_title = group_doc["title"]
+        group_kind = group_doc["kind"]
+        input_tokens = group_doc.get("input_tokens")
+        output_tokens = group_doc.get("output_tokens")
+
         print("")
         log(f"Processing group {group_title} (ID: {group_id}) ({idx}/{total_groups})", "info")
 
@@ -296,7 +271,7 @@ def process_groups():
             )
         else:
             log(f"Invalid Group ID {group_id}, skipping image processing.", "error")
-            update_group_status(conn, group_id, 2)
+            update_group_status(db, group_id, 2)
             continue
 
         log(f"Image file path: {image_file_path}", "info")
@@ -306,7 +281,7 @@ def process_groups():
             log(f"Image data length: {len(base64_image)}", "info")
         except FileNotFoundError:
             log(f"Image file not found: {image_file_path}", "error")
-            update_group_status(conn, group_id, 2)
+            update_group_status(db, group_id, 2)
             continue
 
         payload = construct_payload(group_title, prompt_template, base64_image)
@@ -322,7 +297,7 @@ def process_groups():
                 json=payload,
             )
             handle_response(
-                conn,
+                db,
                 response,
                 group_id,
                 group_title,
@@ -337,7 +312,7 @@ def process_groups():
     
     print("")
     log("Processing complete", "info")
-    conn.close()
+    client.close()
 
 
 if __name__ == "__main__":
